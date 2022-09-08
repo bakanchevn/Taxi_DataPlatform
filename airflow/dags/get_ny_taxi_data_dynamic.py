@@ -8,15 +8,17 @@ from airflow.decorators import dag, task, task_group
 from airflow.operators.empty import EmptyOperator
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from airflow.providers.telegram.hooks.telegram import TelegramHook
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
 from airflow.providers.telegram.operators.telegram import TelegramOperator
 from airflow.utils.task_group import TaskGroup
 
+
 CHAT_ID = "-1001708172657"
 CONN_ID = 'TelegramBotMessage'
-TRIP_DATA_FILES = ['yellow_tripdata', 'green_tripdata']
+TRIP_DATA_FILES = ['yellow_tripdata', 'green_tripdata', 'fhv_tripdata']
 
 @task
-def get_NY_Taxi_data(url_name) -> str | None:
+def get_NY_Taxi_data(url_name: str) -> str | None:
     """
     download the NY Taxi Data from the cloudfront URL
     """
@@ -39,7 +41,8 @@ def checkGcsFiles(taxi_type: str, year: List[int], month: List[int]) -> List[str
     """
     Check if files are already in GCS
     """
-
+    # 2021, 2022
+    # 1, 2, ... , 12
     gcs_hook = GCSHook('GCS_NY_Taxi')
 
     missing_file_list = []
@@ -57,49 +60,68 @@ def checkGcsFiles(taxi_type: str, year: List[int], month: List[int]) -> List[str
 def task_flow():
 
     @task
-    def send_telegram_message(data:List[str], taxi_type: str) -> int:
-        tgHook = TelegramHook(telegram_conn_id=CONN_ID, chat_id=CHAT_ID)
+    def send_telegram_message(data:List[str], taxi_type: str, conn_id: str, chat_id: str) -> List[str]:
+        tgHook = TelegramHook(telegram_conn_id=conn_id, chat_id=chat_id)
         data_list = [x for x in data if x != 'None']
         tg_api_parms = {
             "text": f"Processed {data_list if data_list else '0'} files for {taxi_type}"
         }
         tgHook.send_message(tg_api_parms)
-        return len(data_list)
+        return data_list
 
     @task.branch()
     def get_cnt_from_data_processing(**kwargs) -> str:
         cnt = []
         for file_type in TRIP_DATA_FILES:
-            cnt.append(kwargs['ti'].xcom_pull(task_ids=f'send_tg_{file_type}_data'))
+            cnt_gather = kwargs['ti'].xcom_pull(task_ids=f'get_taxi_data.send_tg_{file_type}')
+            print(cnt_gather)
+            if cnt_gather:
+                cnt.extend(cnt_gather)
 
-        if sum(cnt) == 0:
+        if len(cnt) == 0:
             return 'no_files_needed'
         else:
+            kwargs['ti'].xcom_push(key='cnt', value=cnt)
             return f'push_data_to_bq'
-
-
-    # with TaskGroup('GetTaxiData') as get_taxi_data:
-    #     sum_cnt = 0
-    #     for taxi_type in ['yellow_tripdata', 'green_tripdata']:
-    #         get_missing_files = checkGcsFiles.override(task_id='get_missing_files')(taxi_type, [2022], [x for x in range(1, 13)])
-    #         # branch = get_files_if_needed(get_missing_files, taxi_type)
-    #         process_task = get_NY_Taxi_data.override(task_id=f'process_{taxi_type}').partial().expand(url_name=get_missing_files)
-    #         send_telegram_message.override(task_id=f'send_tg_{taxi_type}')(process_task, taxi_type)
 
     @task_group(group_id='get_taxi_data')
     def get_taxi_data() -> List[str]:
         sum_cnt = []
 
         for taxi_type in TRIP_DATA_FILES:
-            get_missing_files = checkGcsFiles.override(task_id='get_missing_files_{taxi_type}')(taxi_type, [2022],
+            get_missing_files = checkGcsFiles.override(task_id=f'get_missing_files_{taxi_type}')(taxi_type, [2022],
                                                                                     [x for x in range(1, 13)])
             # branch = get_files_if_needed(get_missing_files, taxi_type)
             process_task = get_NY_Taxi_data.override(task_id=f'process_{taxi_type}').partial().expand(
                 url_name=get_missing_files)
-            sum_cnt.append(send_telegram_message.override(task_id=f'send_tg_{taxi_type}')(process_task, taxi_type))
+            sum_cnt.append(send_telegram_message.override(task_id=f'send_tg_{taxi_type}')(process_task, taxi_type, conn_id=CONN_ID, chat_id=CHAT_ID))
         return sum_cnt
+    #
+    # bucket: Any,
+    # source_objects: Any,
+    # destination_project_dataset_table: Any,
+    # source_format: str = 'CSV',
+    @task
+    def push_data_to_bq(**kwargs) -> List[str]:
+        cnt = kwargs['ti'].xcom_pull(key='cnt')
 
-    EmptyOperator(task_id = 'start') >> get_taxi_data() >> get_cnt_from_data_processing() >> [EmptyOperator(task_id ='no_files_needed'), EmptyOperator(task_id ='push_data_to_bq')]
+        op = GCSToBigQueryOperator(
+                          task_id='push_data_to_bq_2',
+                          bucket = 'taxi_project_data',
+                          source_objects=cnt,
+                         schema_fields=[
+                              {'name': 'VendorID', 'type': 'STRING', 'mode': 'NULLABLE'},
+                          ],
+                          destination_project_dataset_table='taxi_data.bq_taxi_data',
+                          source_format='PARQUET',
+                          write_disposition='WRITE_TRUNCATE',
+                          dag=dag,
+                          gcp_conn_id='GCS_NY_Taxi')
+        op.execute(None)
+        return cnt
+
+    no_files_needed = EmptyOperator(task_id='no_files_needed')
+    EmptyOperator(task_id = 'start') >> get_taxi_data() >> get_cnt_from_data_processing() >> [no_files_needed, push_data_to_bq()]
             # branch >> [send_telegram_message, EmptyOperator(task_id=f'no_files_needed_{taxi_type}')]
     #
 

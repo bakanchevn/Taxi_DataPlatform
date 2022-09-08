@@ -38,7 +38,7 @@ with DAG(
                 print(resp.status_code)
                 if resp.status_code == 200:
                     file_list.append(f"{taxi_type}_{year}-{month:02d}.parquet")
-                    gcs_hook.upload('taxi_project_data', f'{taxi_type}_{year}-{month:02d}.parquet', data=resp.content, timeout=200)
+                    gcs_hook.upload('taxi_project_data', f'{taxi_type}_{year}-{month:02d}.parquet', data=resp.content, timeout=400)
         return file_list
 
 
@@ -48,7 +48,7 @@ with DAG(
         op_kwargs={
             'taxi_type': 'yellow_tripdata',
             'year_list': [2022],
-            'month_list': [x for x in range(1, 13)]
+            'month_list': [x for x in range(1, 7)]
         }
     )
 
